@@ -18,9 +18,13 @@ import org.joda.time.format.DateTimeFormatter;
 import org.joda.time.format.ISODateTimeFormat;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.client.ClientHttpRequestFactory;
-import org.springframework.util.StringUtils;
+import org.springframework.retry.RetryCallback;
+import org.springframework.retry.RetryContext;
+import org.springframework.retry.backoff.ExponentialBackOffPolicy;
+import org.springframework.retry.policy.SimpleRetryPolicy;
+import org.springframework.retry.support.RetryTemplate;
+import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestTemplate;
-import org.springframework.web.util.HtmlUtils;
 import org.springframework.web.util.UriUtils;
 
 import java.io.UnsupportedEncodingException;
@@ -39,10 +43,12 @@ import java.util.*;
 public class OTXConnection {
 
     private RestTemplate restTemplate;
+    private RetryTemplate retryTemplate;
+
     private String otxHost = "otx.alienvault.com";
     private String otxScheme = "https";
     private Integer otxPort = null;
-    private static DateTimeFormatter fmt = ISODateTimeFormat.dateTime();
+    private static DateTimeFormatter fmt = ISODateTimeFormat.dateTimeNoMillis();
     private Log log = LogFactory.getLog(OTXConnection.class);
 
     /**
@@ -104,6 +110,8 @@ public class OTXConnection {
     private void configureRestTemplate(String apiKey) {
         ClientHttpRequestFactory requestFactory = HTTPConfig.createRequestFactory(apiKey);
         restTemplate = new RestTemplate(requestFactory);
+        retryTemplate = new RetryTemplate();
+        retryTemplate.setBackOffPolicy(new ExponentialBackOffPolicy());
     }
 
     /**
@@ -196,6 +204,7 @@ public class OTXConnection {
 
     /**
      * Create a new pulse.
+     *
      * @param newPulse - object representing the pulse to create
      * @return the newly created Pulse object with ID and created meta-data
      * @throws MalformedURLException
@@ -207,6 +216,7 @@ public class OTXConnection {
 
     /**
      * Allows the ability to follow, subscribe, unfollow, and unsubscribe
+     *
      * @param username - NOTE this is case-sensitive
      * @param action - the action to perform
      * @return - the response with a value for the key 'status'
@@ -242,10 +252,21 @@ public class OTXConnection {
     }
 
     private List<Pulse> getPulses(Map<OTXEndpointParameters, ?> endpointParametersMap) throws URISyntaxException, MalformedURLException {
+
         return (List<Pulse>) getPagedResults(endpointParametersMap, new PulsePage(), OTXEndpoints.SUBSCRIBED);
     }
 
     private List<?> getPagedResults(Map<OTXEndpointParameters, ?> endpointParametersMap, Page<?> page, OTXEndpoints endpoint) throws MalformedURLException, URISyntaxException {
+        if (endpointParametersMap == null || !endpointParametersMap.containsKey(OTXEndpointParameters.LIMIT)){
+               Map newParams;
+               if (endpointParametersMap != null) {
+                   newParams = new HashMap(endpointParametersMap);
+               }else{
+                   newParams = new HashMap();
+               }
+               newParams.put(OTXEndpointParameters.LIMIT, 20);
+               endpointParametersMap = newParams;
+           }
         List pulseList = new ArrayList<>();
         Page<?> firstPage = executeGetRequest(endpoint, endpointParametersMap, page.getClass());
         pulseList.addAll(firstPage.getResults());
@@ -281,8 +302,18 @@ public class OTXConnection {
 
     }
 
-    private <T> T executeGetRequest(OTXEndpoints subscribed, Map<OTXEndpointParameters, ?> endpointParametersMap, Class<T> classType) throws URISyntaxException, MalformedURLException {
-        return restTemplate.getForObject(buildURI(subscribed, endpointParametersMap), classType);
+    private <T> T executeGetRequest(final OTXEndpoints subscribed, final Map<OTXEndpointParameters, ?> endpointParametersMap, final Class<T> classType) throws MalformedURLException, URISyntaxException {
+
+        final URI url = buildURI(subscribed, endpointParametersMap);
+
+        return  retryTemplate.execute(new RetryCallback<T, RestClientException>() {
+
+            public T doWithRetry(RetryContext context) {
+                // Do stuff that might fail, e.g. webservice operation
+                return restTemplate.getForObject(url, classType);
+            }
+
+        });
     }
 
     private URI buildURI(OTXEndpoints endpoint, Map<OTXEndpointParameters, ?> endpointParametersMap) throws URISyntaxException, MalformedURLException {
